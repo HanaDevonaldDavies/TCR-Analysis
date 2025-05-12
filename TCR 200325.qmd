@@ -1,0 +1,568 @@
+---
+title: "TCR Repertoire 13032025"
+format: html
+editor: visual
+---
+
+## TCR Analysis Pipeline
+
+TCR Repertoire Analysis based on Immunogenomics literature
+
+Load data and process data
+
+```{r}
+# SETUP
+setwd("C:\\Users\\davie\\Downloads\\TCRseq_data")
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggseqlogo)
+library(ggplot2)
+library(patchwork)
+
+# LOAD AND CLEAN MULTIPLE CSVs
+file_list <- list.files(pattern = "*.csv")
+tcr_data <- lapply(file_list, read_csv)
+names(tcr_data) <- file_list
+
+# Combine all TCR datasets into a single dataframe
+tcr_df <- bind_rows(tcr_data, .id = "Sample") %>%
+  mutate(
+    Sample = str_extract(Sample, "[0-9]+_CA[0-9]+_[^_]+_[^_]+_[^_]+"),
+    antigen_type = case_when(
+      str_detect(Sample, "WT-WT") ~ "wildtype",
+      str_detect(Sample, "11R-11R") ~ "11R_11R",
+      str_detect(Sample, "11R-WT") ~ "11R_WT",
+      TRUE ~ "other"
+    )
+  ) %>%
+  filter(!Sample %in% c("06_CA102_P25_11R-WT_hTRB", "12_CA126_5T4_11R-11R_hTRB"),
+     str_detect(Sample, "4R")    
+         ) %>%
+  filter(!is.na(`CDR3(pep)`), `CDR3(pep)` != "") %>%
+  mutate(
+    `CDR3(pep)` = toupper(str_replace_all(`CDR3(pep)`, "[^A-Z]", "")),
+    seq_length = nchar(`CDR3(pep)`)
+  )
+```
+
+Logos
+
+```{r}
+generate_logos <- function(seqs, title) {
+  if (length(seqs) < 3) return(NULL)
+
+  list(
+    seq = ggseqlogo(seqs, method = "prob") +
+      ggtitle(paste(title, "Sequence")) +
+      theme(plot.title = element_text(size = 10)),
+
+    hydro = ggseqlogo(seqs, method = "prob", col_scheme = "hydrophobicity") +
+      ggtitle(paste(title, "Hydrophobicity")) +
+      theme(plot.title = element_text(size = 10)),
+
+    chem = ggseqlogo(seqs, method = "prob", col_scheme = "chemistry") +
+      ggtitle(paste(title, "Chemical Properties")) +
+      theme(plot.title = element_text(size = 10))
+  )
+}
+```
+
+Generate
+
+```{r}
+samples <- unique(tcr_df$Sample)
+
+for (s in samples) {
+  df_sample <- tcr_df %>% filter(Sample == s)
+
+  # Skip if no CDR3 data
+  if (nrow(df_sample) < 3) next
+
+  median_len <- median(df_sample$seq_length, na.rm = TRUE)
+
+  # Filter only sequences of median length
+  seqs <- df_sample %>%
+    filter(seq_length == median_len) %>%
+    pull(`CDR3(pep)`)
+
+  if (length(seqs) < 3) next  # Not enough to plot
+
+  # Generate logos
+  logos <- generate_logos(seqs, paste0(s, " | Median Len = ", median_len))
+
+  # Save each logo
+  ggsave(paste0("logo_", s, "_seq.png"), plot = logos$seq, width = 8, height = 3, dpi = 300)
+  ggsave(paste0("logo_", s, "_hydro.png"), plot = logos$hydro, width = 8, height = 3, dpi = 300)
+  ggsave(paste0("logo_", s, "_chem.png"), plot = logos$chem, width = 8, height = 3, dpi = 300)
+}
+```
+
+Gene Usage
+
+```{r}
+gene_usage <- tcr_df %>%
+  select(antigen_type, V, D, J, C) %>%
+  pivot_longer(
+    cols = c(V, D, J, C),
+    names_to = "gene_type",
+    values_to = "gene",
+    values_drop_na = TRUE
+  ) %>%
+  count(antigen_type, gene_type, gene) %>%
+  group_by(antigen_type, gene_type) %>%
+  mutate(perc = n / sum(n) * 100) %>%
+  ungroup()
+
+# Save gene usage table
+write_csv(gene_usage, "gene_usage_results.csv")
+```
+
+Plots
+
+```{r}
+plot_gene_usage <- function(data, gene_type_label, filename) {
+  p <- data %>%
+    filter(gene_type == gene_type_label) %>%
+    ggplot(aes(x = reorder(gene, -perc), y = perc, fill = antigen_type)) +
+    geom_col(position = position_dodge(preserve = "single")) +
+    labs(
+      title = paste(gene_type_label, "Gene Usage by Antigen Type"),
+      x = paste(gene_type_label, "Gene"),
+      y = "Percentage (%)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  ggsave(filename, plot = p, width = 10, height = 5, dpi = 300)
+}
+
+# Create separate plots
+plot_gene_usage(gene_usage, "V", "v_usage.png")
+plot_gene_usage(gene_usage, "D", "d_usage.png")
+plot_gene_usage(gene_usage, "J", "j_usage.png")
+plot_gene_usage(gene_usage, "C", "c_usage.png")
+```
+
+CDR3 Length Distribution
+
+```{r}
+tcr_filtered <- tcr_df %>%
+  filter(antigen_type %in% c("wildtype", "11R_11R", "11R_WT")) %>%
+  mutate(
+    `CDR3(pep)` = toupper(str_replace_all(`CDR3(pep)`, "[^A-Z]", "")),
+    seq_length = nchar(`CDR3(pep)`)
+  ) %>%
+  filter(seq_length > 0)
+
+# Plot length distribution
+p_len <- ggplot(tcr_filtered, aes(x = seq_length, fill = antigen_type)) +
+  geom_histogram(binwidth = 1, position = "dodge") +
+  labs(
+    title = "CDR3 Length Distribution (Wildtype vs Modified)",
+    x = "CDR3 Length (Amino Acids)",
+    y = "Clone Count"
+  ) +
+  theme_minimal()
+
+# Save the plot
+ggsave("cdr3_length_distribution_filtered.png", p_len, width = 8, height = 4, dpi = 300)
+```
+
+Sequence logos by antigen
+
+```{r}
+library(dplyr)
+library(stringr)
+library(ggseqlogo)
+library(ggplot2)
+library(tidyr)
+
+# Generate unscaled sequence logos incorporating clone expansion
+tcr_df %>%
+  group_by(antigen_type) %>%
+  group_walk(~{
+    df <- .x %>%
+      filter(!is.na(`CDR3(pep)`), !is.na(copy), copy > 0) %>%
+      mutate(
+        pep = str_to_upper(`CDR3(pep)`),
+        len = nchar(pep)
+      )
+
+    # Keep only sequences of the median length
+    median_len <- median(df$len)
+    df <- df %>% filter(len == median_len)
+
+    # Expand sequences based on clonal copy number
+    seqs_expanded <- rep(df$pep, df$copy)
+
+    if (length(seqs_expanded) >= 3) {
+      p_logo <- ggseqlogo(seqs_expanded, method = "prob") +
+        ggtitle(paste("CDR3 Sequence Logo |", .y$antigen_type)) +
+        theme(plot.title = element_text(hjust = 0.5))
+
+      ggsave(
+        filename = paste0("cdr3_logo_", .y$antigen_type, "_unscaled_with_expansion.png"),
+        plot = p_logo,
+        width = 8,
+        height = 3,
+        dpi = 300
+      )
+
+      print(p_logo)
+    }
+  })
+```
+
+```{r}
+ tcr_df %>%
+    group_by(antigen_type) %>%
+    group_walk(~{
+      seqs <- .x$`CDR3(pep)` %>% na.omit() %>% str_to_upper()
+      seqs <- seqs[nchar(seqs) == median(nchar(seqs))]  # use median length only
+
+      if (length(seqs) >= 3) {
+        p_logo <- ggseqlogo(seqs, method = "prob") +
+          ggtitle(paste("CDR3 Sequence Logo |", .y$antigen_type)) +
+          theme(plot.title = element_text(hjust = 0.5))
+
+        ggsave(
+          filename = paste0("cdr3_logo_", .y$antigen_type, ".png"),
+          plot = p_logo,
+          width = 8,
+          height = 3,
+          dpi = 300
+        )
+
+        print(p_logo)
+      }
+    })
+}
+```
+
+Chemical Property Analysis
+
+```{r}
+library(dplyr)
+library(Peptides)
+library(stringr)
+
+aa_properties <- tcr_filtered %>%
+  mutate(`CDR3(pep)` = toupper(str_replace_all(`CDR3(pep)`, "[^A-Z]", ""))) %>%
+  rowwise() %>%
+  mutate(
+    hydrophobicity = hydrophobicity(`CDR3(pep)`, scale = "KyteDoolittle"),
+    charge = charge(`CDR3(pep)`, pH = 7.4)
+  ) %>%
+  ungroup() %>%
+  select(antigen_type, Sample, `CDR3(pep)`, seq_length, hydrophobicity, charge)
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+library(Peptides) 
+
+tcr_filtered <- tcr_filtered %>%
+  group_by(Sample, `CDR3(pep)`) %>%
+  mutate(seq_count = n()) %>%
+  ungroup()
+
+aa_properties <- tcr_filtered %>%
+  mutate(`CDR3(pep)` = str_remove_all(toupper(`CDR3(pep)`), "[^ACDEFGHIKLMNPQRSTVWY]")) %>%
+  rowwise() %>%
+  mutate(
+    hydrophobicity = hydrophobicity(`CDR3(pep)`, scale = "KyteDoolittle"),
+    charge = charge(`CDR3(pep)`, pH = 7.4)
+  ) %>%
+  ungroup() %>%
+  mutate(expanded = if_else(seq_count > 1, "Expanded", "Not Expanded")) %>%
+  dplyr::select(antigen_type, Sample, `CDR3(pep)`, seq_length, hydrophobicity, charge, expanded)
+```
+
+Boxplot for hydrophobicity and Charge by antigen type
+
+```{r}
+library(ggplot2)
+
+# Hydrophobicity
+ggplot(aa_properties, aes(x = antigen_type, y = hydrophobicity, fill = antigen_type)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  labs(title = "Hydrophobicity of CDR3 Sequences by Antigen Type",
+       x = "Antigen Type", y = "Hydrophobicity (Kyte-Doolittle)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Charge
+ggplot(aa_properties, aes(x = antigen_type, y = charge, fill = antigen_type)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  labs(title = "Charge of CDR3 Sequences by Antigen Type",
+       x = "Antigen Type", y = "Net Charge at pH 7.4") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Violin Plots (Density + distribution)
+
+```{r}
+# Hydrophobicity Violin Plot
+ggplot(aa_properties, aes(x = antigen_type, y = hydrophobicity, fill = antigen_type)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(title = "Hydrophobicity Distribution by Antigen Type",
+       y = "Hydrophobicity", x = "") +
+  theme_minimal()
+
+```
+
+Charge
+
+```{r}
+ggplot(aa_properties, aes(x = antigen_type, y = charge, fill = antigen_type)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(title = "Charge Distribution by Antigen Type",
+       y = "Charge (pH 7.4)", x = "") +
+  theme_minimal()
+
+ggsave("Chargedist.png", width = 8, height = 5, dpi = 300)
+```
+
+Cumulative Freq
+
+```{r}
+library(ggplot2)
+
+# Create cumulative frequency plot
+cumulative_freq <- tcr_filtered %>%
+  group_by(antigen_type) %>%
+  arrange(desc(copy)) %>%
+  mutate(
+    clone_rank = row_number(),
+    cum_freq = cumsum(copy) / sum(copy)
+  )
+
+ggplot(cumulative_freq, aes(x = clone_rank, y = cum_freq, color = antigen_type)) +
+  geom_line() +
+  labs(
+    title = "Cumulative Frequency Curve",
+    x = "Clone Rank (sorted by abundance)",
+    y = "Cumulative Frequency"
+  ) +
+  theme_minimal()
+
+ggsave("Cumulative Frequency Curve.png", width = 8, height = 5, dpi = 300)
+```
+
+Cut off for expansion
+
+```{r}
+tcr_filtered <- tcr_filtered %>%
+  group_by(antigen_type) %>%
+  arrange(desc(copy)) %>%
+  mutate(
+    cum_freq = cumsum(copy) / sum(copy),
+    expanded = ifelse(cum_freq <= 0.5, TRUE, FALSE)  # top 50% by frequency
+  ) %>%
+  ungroup()
+```
+
+Compare properties between expanded and non-expanded clones
+
+```{r}
+ggplot(aa_properties, aes(x = expanded, y = hydrophobicity, fill = expanded)) +
+  geom_boxplot() +
+  facet_wrap(~antigen_type) +
+  labs(title = "Hydrophobicity in Expanded vs Non-Expanded Clones")
+
+ggsave("hydrophobicity_expanded_boxplot.png", width = 8, height = 5, dpi = 300)
+```
+
+Normalisation:
+
+```{r}
+tcr_filtered <- tcr_filtered %>%
+  mutate(
+    Sample = str_extract(file, "[0-9]+_CA[0-9]+_[^_]+_[^_]+_[^_]+")
+  )
+```
+
+```{r}
+# Clean both
+tcr_filtered <- tcr_filtered %>%
+  mutate(
+    `CDR3(pep)` = toupper(str_replace_all(`CDR3(pep)`, "[^A-Z]", "")),
+    Sample = str_trim(as.character(Sample))
+  )
+
+aa_properties <- aa_properties %>%
+  mutate(
+    `CDR3(pep)` = toupper(str_replace_all(`CDR3(pep)`, "[^A-Z]", "")),
+    Sample = str_trim(as.character(Sample))
+  )
+
+aa_properties <- aa_properties %>%
+  left_join(
+    tcr_filtered %>% select(Sample, `CDR3(pep)`, expanded),
+    by = c("Sample", "CDR3(pep)")
+  )
+```
+
+Volcano Plot for Amino Acid Properties
+
+```{r}
+library(dplyr)
+
+# Example: Compare hydrophobicity between expanded vs non-expanded
+volcano_data <- aa_properties %>%
+  filter(!is.na(expanded)) %>%
+  group_by(expanded) %>%
+  summarise(
+    mean_hydro = mean(hydrophobicity, na.rm = TRUE),
+    n = n()
+  ) %>%
+  ungroup()
+
+# Perform statistical test (e.g., t-test or Wilcoxon)
+test_result <- wilcox.test(
+  hydrophobicity ~ expanded,
+  data = aa_properties
+)
+
+# Create volcano-like data frame
+volcano_df <- aa_properties %>%
+  group_by(expanded) %>%
+  summarise(mean_hydro = mean(hydrophobicity, na.rm = TRUE)) %>%
+  summarise(
+    log2FC = log2(mean_hydro[expanded == TRUE] / mean_hydro[expanded == FALSE]),
+    p_value = test_result$p.value
+  ) %>%
+  mutate(neg_log10_p = -log10(p_value))
+
+# Create summary data for multiple features
+volcano_multi <- tibble(
+  feature = c("hydrophobicity", "charge", "seq_length"),
+  log2FC = c(
+    log2(mean(aa_properties$hydrophobicity[aa_properties$expanded == TRUE], na.rm = TRUE) /
+         mean(aa_properties$hydrophobicity[aa_properties$expanded == FALSE], na.rm = TRUE)),
+    
+    log2(mean(aa_properties$charge[aa_properties$expanded == TRUE], na.rm = TRUE) /
+         mean(aa_properties$charge[aa_properties$expanded == FALSE], na.rm = TRUE)),
+
+    log2(mean(aa_properties$seq_length[aa_properties$expanded == TRUE], na.rm = TRUE) /
+         mean(aa_properties$seq_length[aa_properties$expanded == FALSE], na.rm = TRUE))
+  ),
+  p_value = c(
+    wilcox.test(hydrophobicity ~ expanded, data = aa_properties)$p.value,
+    wilcox.test(charge ~ expanded, data = aa_properties)$p.value,
+    wilcox.test(seq_length ~ expanded, data = aa_properties)$p.value
+  )
+) %>%
+  mutate(neg_log10_p = -log10(p_value))
+```
+
+Volcano plot
+
+```{r}
+ggplot(volcano_multi, aes(x = log2FC, y = neg_log10_p, label = feature)) +
+  geom_point(color = "steelblue", size = 4) +
+  geom_text(vjust = -1.5, size = 4) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Volcano Plot: Property Differences (Expanded vs Non-Expanded)",
+    x = "Log2 Fold Change (Expanded / Non-Expanded)",
+    y = "-Log10 P-value"
+  ) +
+  theme_minimal()
+
+ggsave("volcano_plot_amino_acid_properties.png", plot = last_plot(), width = 8, height = 5, dpi = 300)
+```
+
+Clonal Distribution
+
+```{r}
+# Create a clone frequency table
+clone_dist <- tcr_filtered %>%
+  filter(copy > 0) %>%
+  count(copy, name = "n_clones") %>%
+  arrange(copy)
+
+# Log-scale option if needed
+clone_dist <- clone_dist %>%
+  mutate(copy_bin = cut(copy,
+                        breaks = c(1, 2, 5, 10, 20, 50, 100, 250, 500, 1000, Inf),
+                        include.lowest = TRUE))
+```
+
+plot
+
+```{r}
+ggplot(clone_dist_filtered, aes(x = copy, y = n_clones)) +
+  geom_col(fill = "steelblue", color = "black") +
+  scale_x_continuous(trans = "log10", breaks = c(1, 10, 100, 1000)) +
+  scale_y_continuous(labels = scales::comma, limits = c(0, 30000)) +
+  labs(
+    title = "Clonal Distribution (Filtered)",
+    x = "Clone Size (Copy Number, log10 scale)",
+    y = "Number of Clones"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+cumulative_df <- tcr_filtered %>%
+  arrange(desc(copy)) %>%
+  mutate(
+    rank = row_number(),
+    cum_freq = cumsum(copy) / sum(copy)
+  )
+
+ggplot(cumulative_df, aes(x = rank, y = cum_freq)) +
+  geom_line(color = "darkred") +
+  labs(
+    title = "Cumulative Clone Frequency",
+    x = "Clone Rank",
+    y = "Cumulative Frequency"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+library(DiagrammeR)
+
+grViz("
+digraph RNAseq_Workflow {
+  graph [layout = dot, rankdir = LR]
+
+  node [shape = box, style = filled, color = lightblue, fontname = Helvetica]
+
+  A [label = 'Sample Grouping\\n(Modified vs Wild-type)']
+  B [label = 'Differential Expression\\n(DESeq2)']
+  C [label = 'Filter: log2FC > 1\\nand FDR < 0.05']
+  D [label = 'Visualization:\\nVolcano Plots & Heatmaps']
+
+  A -> B -> C -> D
+}
+")
+```
+
+```{r}
+library(DiagrammeR)
+
+grViz("
+digraph tcr_workflow {
+  graph [layout = dot, rankdir = LR]
+
+  node [shape = box, style = filled, fillcolor = lightblue, fontcolor = black, fontsize = 12]
+
+  A [label = 'Sample Stratification:\\n(WT_WT, 11R_WT, 11R_11R)']
+  B [label = 'Clonal Expansion\\n(by Copy Number)']
+  C [label = 'CDR3 Feature Analysis:\\nHydrophobicity, Charge, Length']
+  D [label = 'Motif Visualization:\\nSequence Logos, Hydrophobicity plots,\\nVolcano Plots, Cumulative Distribution']
+
+  A -> B -> C -> D
+}
+")
+```
